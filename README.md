@@ -15,7 +15,7 @@ public static ClickHouseComponent GetZoneClickHouse(this DBManagerComponent self
     return null;
 }
 
-public static ClickHouseComponent CreateZoneClickHouse(this DBManagerComponent self, int zone, string connectionString, string dbName)
+public static ClickHouseComponent CreateZoneClickHouse(this DBManagerComponent self, int zone, string connectionString, string dbName = "default")
 {
     /*
         connectionString 说明：
@@ -25,10 +25,6 @@ public static ClickHouseComponent CreateZoneClickHouse(this DBManagerComponent s
     if (clickHouseComponent != null)
     {
         throw new Exception($"zone: {zone} already created clickHouse");
-    }
-    if (string.IsNullOrEmpty(dbName))
-    {
-        dbName = "default";
     }
     return self.AddChildWithId<ClickHouseComponent, string, string>(zone, connectionString, dbName);
 }
