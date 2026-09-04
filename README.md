@@ -29,6 +29,4 @@ public static ClickHouseComponent CreateZoneClickHouse(this DBManagerComponent s
     return self.AddChildWithId<ClickHouseComponent, string, string>(zone, connectionString, dbName);
 }
 
-
-
 EventFileStore.cs  ====> 可与ClickHouse 结合的10亿级事件高性能并发缓存管道，丢失率0.01%以下，需优雅关闭保存索引！
