@@ -25,8 +25,13 @@ namespace ET.DrSdk
         
         private readonly Dictionary<string, EventIndex> _index = new();
         private bool _isDisposed;
-        private DateTime _lastSaveTime = DateTime.Now;
-        private const int SAVE_INTERVAL_SECONDS = 30;   // 每 30 秒保存一次
+
+        /// <summary>
+        /// 上次落索引的时间(ET 毫秒时间戳，取值 TimeInfo.Instance.ClientNow())。
+        /// 不用 DateTime.Now：本地时间受时区/DST 变更影响会跳变，30 秒的落盘间隔会算不准。
+        /// </summary>
+        private long _lastSaveMs;
+        private const int SAVE_INTERVAL_MS = 30 * 1000;   // 每 30 秒保存一次
         private const uint FILE_MAGIC = 0x4B41464B;
         private const string INDEX_FILE = "events.idx";
         private const string SEGMENT_PREFIX = "event_";
@@ -50,6 +55,7 @@ namespace ET.DrSdk
                 
             _storePath = storePath;
             _config = config;
+            _lastSaveMs = TimeInfo.Instance.ClientNow();
             
             if (!Directory.Exists(_storePath))
                 Directory.CreateDirectory(_storePath);
@@ -114,10 +120,10 @@ namespace ET.DrSdk
                 //_activeStream.Flush(); //当然如果有刷的话 开启 Asynchronous  用_activeStream.FlushAsync()更好
                 // 没有马上刷文件，待文件缓冲区满后才刷到OS页，有很小的概率会丢,但性能好
                 
-                if (saveIndex && (DateTime.Now - _lastSaveTime).TotalSeconds >= SAVE_INTERVAL_SECONDS)
+                if (saveIndex && TimeInfo.Instance.ClientNow() - _lastSaveMs >= SAVE_INTERVAL_MS)
                 {
                     SaveIndex();//一定次数保存一次可能会丢，但影响不大，可以降低磁盘IO
-                    _lastSaveTime = DateTime.Now;
+                    _lastSaveMs = TimeInfo.Instance.ClientNow();
                 }
                 return true;
           
@@ -253,10 +259,10 @@ namespace ET.DrSdk
             
             if (_index.Remove(eventId, out _))
             {
-                if (saveIndex && (DateTime.Now - _lastSaveTime).TotalSeconds >= SAVE_INTERVAL_SECONDS)
+                if (saveIndex && TimeInfo.Instance.ClientNow() - _lastSaveMs >= SAVE_INTERVAL_MS)
                 {
                     SaveIndex();//一定次数保存一次可能会丢，但影响不大，可以降低磁盘IO
-                    _lastSaveTime = DateTime.Now;
+                    _lastSaveMs = TimeInfo.Instance.ClientNow();
                 }
                 return true;
             }
@@ -278,16 +284,37 @@ namespace ET.DrSdk
             return _index.Keys.ToList();
         }
         
-        public Queue<string> GetAllEventIdsAsQueue()
+        public Queue<string> GetAllEventIdsAsQueue(int maxCount)
         {
-            // 按文件偏移量排序（写入顺序）
-            var sortedEventIds = _index
-                .OrderBy(kvp => kvp.Value.SegmentId)
-                .ThenBy(kvp => kvp.Value.FileOffset)
-                .Select(kvp => kvp.Key)
-                .ToList();
-            
-            return new Queue<string>(sortedEventIds);
+            if (maxCount <= 0) return new Queue<string>();
+            if (maxCount >= _index.Count) return new Queue<string>(_index.Keys);
+
+            // max-heap：堆顶是当前保留集合中最大的
+            var heap = new PriorityQueue<string, long>(
+                initialCapacity: maxCount,
+                comparer: Comparer<long>.Create((a, b) => b.CompareTo(a)));
+
+            foreach (var kvp in _index)
+            {
+                long key = ((long)kvp.Value.SegmentId << 32) | (uint)kvp.Value.FileOffset;
+                if (heap.Count < maxCount)
+                    heap.Enqueue(kvp.Key, key);
+                else
+                {
+                    heap.TryPeek(out _, out long topKey);
+                    if (key < topKey)
+                    {
+                        heap.Dequeue();
+                        heap.Enqueue(kvp.Key, key);
+                    }
+                }
+            }
+
+            // max-heap 弹出是降序，反转成升序（最早在前）
+            var result = new List<string>(heap.Count);
+            while (heap.Count > 0) result.Add(heap.Dequeue());
+            result.Reverse();
+            return new Queue<string>(result);
         }
         
         public int GetEventCount()
@@ -305,6 +332,8 @@ namespace ET.DrSdk
         {
             try
             {
+                _activeWriter.Flush();
+                _activeStream.Flush();
                 var indexFile = Path.Combine(_storePath, INDEX_FILE);
                 using (var fs = new FileStream(indexFile, FileMode.Create, FileAccess.Write, FileShare.ReadWrite, BUFFER_SIZE, 
                            FileOptions.SequentialScan))
@@ -322,8 +351,7 @@ namespace ET.DrSdk
                     }
                     
                     writer.Flush();
-                    //fs.Flush();//当然如果有刷的话 开启 Asynchronous  fs.FlushAsync()更好
-                    // 没有马上刷文件，待文件缓冲区满后才刷到OS页，有很小的概率会丢,但性能好
+                    fs.Flush();//当然如果有刷的话 开启 Asynchronous  fs.FlushAsync()更好
                 }
                 _config.Log($"索引保存成功");
             }
