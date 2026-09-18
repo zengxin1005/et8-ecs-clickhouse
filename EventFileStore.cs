@@ -418,16 +418,20 @@ namespace ET.DrSdk
             
             if (!File.Exists(indexFile))
             {
-                RebuildIndexFromSegments();//重建有可能导致重发，但是总比丢的好
+                RebuildIndexFromSegments();//重建有可能导致相同Event重发，但是总比丢的好
                 return;
             }
+            
+            // 索引写到一半被杀就会留下"半截索引"：头部说 count 条，实际只落了前几条。
+            int count = 0;      // 头部声明的总条数
+            int loaded = 0;     // 实际完整读出的条数
             
             try
             {
                 using var fs = new FileStream(indexFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite,BUFFER_SIZE,FileOptions.SequentialScan);
                 using var reader = new BinaryReader(fs, Encoding.UTF8, true);
                 
-                var count = reader.ReadInt32();
+                count = reader.ReadInt32();
                 
                 for (int i = 0; i < count; i++)
                 {
@@ -441,6 +445,8 @@ namespace ET.DrSdk
                             DataLength = reader.ReadInt32(),
                             Crc32 = reader.ReadUInt32()
                         };
+                        
+                        loaded++;
                         
                         if (index.SegmentId >= 0 && index.FileOffset >= 0 && 
                             index.DataLength > 0 && index.DataLength <= SEGMENTSIZE)
@@ -462,7 +468,15 @@ namespace ET.DrSdk
             catch
             {
                 // 索引文件损坏，忽略
-                RebuildIndexFromSegments();//重建有可能导致重发，但是总比丢的好
+                RebuildIndexFromSegments();//重建有可能导致相同Event重发，但是总比丢的好
+                return;//重建自身也可能抛，别掉进下面的截断判断里再重建一次
+            }
+            
+            // 半截索引：_index 只覆盖前段，看着"正常"（非空、不报错），但索引没提到的那些 segment
+            if (count < 0 || loaded < count)
+            {
+                Log.Error($"[DRSDK] 索引不完整: 只读出 {loaded}/{count} 条，改为从 segment 重建");
+                RebuildIndexFromSegments();//重建有可能导致相同Event重发，但是总比丢的好
             }
         }
         
@@ -526,6 +540,11 @@ namespace ET.DrSdk
                 foreach (var file in files)
                 {
                     var segmentId = ParseSegmentId(file);
+                    if (segmentId < 0)
+                    {
+                        _config.Log($"跳过非段文件名: {Path.GetFileName(file)}");
+                        continue;
+                    }
                     if (segmentId == _currentSegmentId)
                     {
                         continue;
@@ -546,9 +565,14 @@ namespace ET.DrSdk
         private int ParseSegmentId(string filePath)
         {
             var fileName = Path.GetFileNameWithoutExtension(filePath);
-            var idStr = fileName.Replace(SEGMENT_PREFIX, "");
-            return int.Parse(idStr);
+            if (!fileName.StartsWith(SEGMENT_PREFIX, StringComparison.Ordinal))
+            {
+                return -1;
+            }
+            var idStr = fileName.Substring(SEGMENT_PREFIX.Length);
+            return int.TryParse(idStr, out var id) ? id : -1;
         }
+
         
         
         /// <summary>
@@ -565,11 +589,16 @@ namespace ET.DrSdk
             
             // 段号以「盘上实际文件名」为准，而不是只看索引条目：
             // 尾部可能存在不含有效事件的空段。
-            var maxSegmentId = -1;
+            var maxSegmentId = 0;
             
             foreach (var segmentFile in segmentFiles)
             {
                 var segmentId = ParseSegmentId(segmentFile);
+                if (segmentId < 0)
+                {
+                    _config.Log($"跳过非段文件名: {Path.GetFileName(segmentFile)}");
+                    continue;
+                }
                 if (segmentId > maxSegmentId)
                 {
                     maxSegmentId = segmentId;
