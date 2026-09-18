@@ -418,7 +418,7 @@ namespace ET.DrSdk
             
             if (!File.Exists(indexFile))
             {
-                RebuildIndexFromSegments();
+                RebuildIndexFromSegments();//重建有可能导致重发，但是总比丢的好
                 return;
             }
             
@@ -462,7 +462,7 @@ namespace ET.DrSdk
             catch
             {
                 // 索引文件损坏，忽略
-                RebuildIndexFromSegments();
+                RebuildIndexFromSegments();//重建有可能导致重发，但是总比丢的好
             }
         }
         
