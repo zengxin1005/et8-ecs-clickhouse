@@ -417,7 +417,10 @@ namespace ET.DrSdk
             var indexFile = Path.Combine(_storePath, INDEX_FILE);
             
             if (!File.Exists(indexFile))
+            {
+                RebuildIndexFromSegments();
                 return;
+            }
             
             try
             {
@@ -551,16 +554,26 @@ namespace ET.DrSdk
         /// <summary>
         /// 从所有 segment 文件重建索引
         /// </summary>
-        public void RebuildIndexFromSegments()
+        private void RebuildIndexFromSegments()
         {
-            var newIndex = new Dictionary<string, EventIndex>();
             var segmentFiles = Directory.GetFiles(_storePath, $"{SEGMENT_PREFIX}*{SEGMENT_EXT}")
                 .OrderBy(f => f)  // 按文件名排序
                 .ToList();
+            if(segmentFiles.Count == 0)
+                return;
+            var newIndex = new Dictionary<string, EventIndex>();
+            
+            // 段号以「盘上实际文件名」为准，而不是只看索引条目：
+            // 尾部可能存在不含有效事件的空段。
+            var maxSegmentId = -1;
             
             foreach (var segmentFile in segmentFiles)
             {
                 var segmentId = ParseSegmentId(segmentFile);
+                if (segmentId > maxSegmentId)
+                {
+                    maxSegmentId = segmentId;
+                }
                 
                 using var fs = new FileStream(segmentFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
                 using var reader = new BinaryReader(fs, Encoding.UTF8, true);
@@ -637,9 +650,16 @@ namespace ET.DrSdk
                 _index[kvp.Key] = kvp.Value;
             }
             
+            // 重建后必须把段号接上：否则继续写入会落回旧段号，
+            // 段满换段时 CreateNewSegment 会用 FileMode.Create 把已存在的段文件截断。
+            if (maxSegmentId > _currentSegmentId)
+            {
+                _currentSegmentId = maxSegmentId;
+            }
+            
             // 保存重建后的索引
             SaveIndex();
-            _config.Log($"索引重建完成，共 {_index.Count} 个事件");
+            _config.Log($"索引重建完成，共 {_index.Count} 个事件，当前段号={_currentSegmentId}");
         }
         
         #endregion
