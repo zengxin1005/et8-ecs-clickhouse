@@ -67,7 +67,7 @@ namespace ET.DrSdk
         
         #region 写入操作 - 字节数据
         
-        private bool StoreEvent(string eventId, byte[] data,bool saveIndex = true)
+        private bool StoreEvent(string eventId, byte[] data)
         {
             if (_isDisposed)
                 throw new ObjectDisposedException(nameof(EventFileStore));
@@ -117,10 +117,9 @@ namespace ET.DrSdk
                     SegmentId = _currentSegmentId, FileOffset = fileOffset, DataLength = dataLength, Crc32 = crc32
                 };
                 _activeWriter.Flush();
-                //_activeStream.Flush(); //这里不能实时刷盘，当然如果有刷的话 开启 Asynchronous  用_activeStream.FlushAsync()更好
-                // 没有马上刷文件，待文件缓冲区满后才刷到OS页，有很小的概率会丢,但性能好
+                _activeStream.Flush(); //开启 Asynchronous  用_activeStream.FlushAsync()更好
                 
-                if (saveIndex && TimeInfo.Instance.ClientNow() - _lastSaveMs >= SAVE_INTERVAL_MS)
+                if (TimeInfo.Instance.ClientNow() - _lastSaveMs >= SAVE_INTERVAL_MS)
                 {
                     SaveIndex();//一定次数保存一次可能会丢，但影响不大，可以降低磁盘IO
                     _lastSaveMs = TimeInfo.Instance.ClientNow();
@@ -139,10 +138,10 @@ namespace ET.DrSdk
         
         #region 写入操作 - 字符串数据
         
-        public bool StoreEventString(string eventId, string data,bool saveIndex = true)
+        public bool StoreEventString(string eventId, string data)
         {
             var bytes = Encoding.UTF8.GetBytes(data);
-            return StoreEvent(eventId, bytes,saveIndex);
+            return StoreEvent(eventId, bytes);
         }
         #endregion
         
@@ -252,14 +251,14 @@ namespace ET.DrSdk
         
         #region 删除操作
         
-        public bool DeleteEvent(string eventId,bool saveIndex = true)
+        public bool DeleteEvent(string eventId)
         {
             if (string.IsNullOrEmpty(eventId))
                 return false;
             
             if (_index.Remove(eventId, out _))
             {
-                if (saveIndex && TimeInfo.Instance.ClientNow() - _lastSaveMs >= SAVE_INTERVAL_MS)
+                if (TimeInfo.Instance.ClientNow() - _lastSaveMs >= SAVE_INTERVAL_MS)
                 {
                     SaveIndex();//一定次数保存一次可能会丢，但影响不大，可以降低磁盘IO
                     _lastSaveMs = TimeInfo.Instance.ClientNow();
@@ -332,8 +331,6 @@ namespace ET.DrSdk
         {
             try
             {
-                _activeWriter?.Flush();
-                _activeStream?.Flush();
                 var indexFile = Path.Combine(_storePath, INDEX_FILE);
                 using (var fs = new FileStream(indexFile, FileMode.Create, FileAccess.Write, FileShare.ReadWrite, BUFFER_SIZE, 
                            FileOptions.SequentialScan))
@@ -351,7 +348,7 @@ namespace ET.DrSdk
                     }
                     
                     writer.Flush();
-                    fs.Flush();//当然如果有刷的话 开启 Asynchronous  fs.FlushAsync()更好
+                    fs.Flush();// 开启 Asynchronous  fs.FlushAsync()更好
                 }
                 _config.Log($"索引保存成功");
             }
@@ -462,6 +459,7 @@ namespace ET.DrSdk
             catch
             {
                 // 索引文件损坏，忽略
+                RebuildIndexFromSegments();
             }
         }
         
