@@ -477,6 +477,12 @@ namespace ET.DrSdk
             {
                 Log.Error($"[DRSDK] 索引不完整: 只读出 {loaded}/{count} 条，改为从 segment 重建");
                 RebuildIndexFromSegments();//重建有可能导致相同Event重发，但是总比丢的好
+                return;
+            }
+
+            if (File.Exists(GetSegmentFilePath(_currentSegmentId + 1)))
+            {
+                RebuildIndexFromSegments();//重建有可能导致相同Event重发，但是总比丢的好
             }
         }
         
