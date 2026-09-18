@@ -36,7 +36,7 @@ namespace ET.DrSdk
         private const string INDEX_FILE = "events.idx";
         private const string SEGMENT_PREFIX = "event_";
         private const string SEGMENT_EXT = ".dat";
-        private const int BUFFER_SIZE = 512 * 1024;   
+        private const int BUFFER_SIZE = 512 * 1024;   //如果马上flush就无效
         private const int MAX_EVENTID_LENGTH = 1024;
         private const int SEGMENTSIZE = 10 * 1024 * 1024;
         private DRSDKConfig _config;
