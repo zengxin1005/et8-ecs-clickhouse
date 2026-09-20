@@ -36,7 +36,7 @@ namespace ET.DrSdk
         private const string INDEX_FILE = "events.idx";
         private const string SEGMENT_PREFIX = "event_";
         private const string SEGMENT_EXT = ".dat";
-        private const int BUFFER_SIZE = 512 * 1024;   //如果马上flush就无效
+        private const int BUFFER_SIZE = 64 * 1024;   //如果马上flush就无效
         private const int MAX_EVENTID_LENGTH = 1024;
         private const int SEGMENTSIZE = 10 * 1024 * 1024;
         private DRSDKConfig _config;
@@ -88,6 +88,12 @@ namespace ET.DrSdk
                 {
                     throw new ArgumentException($"Event ID too long: {eventIdBytes.Length} > {MAX_EVENTID_LENGTH}");
                 }
+                // 读取侧（LoadIndex / 重建）会把 DataLength > SEGMENTSIZE 的记录当脏数据跳过，
+                // 所以写入侧必须先拒：否则写进去的记录永远读不出来，还会为它单开一个段。
+                if (dataLength > SEGMENTSIZE)
+                {
+                    throw new ArgumentException($"Event data too large: {dataLength} > {SEGMENTSIZE}");
+                }
                 if (_activeWriter == null)
                 {
                     EnsureActiveSegmentWriter();
@@ -117,7 +123,7 @@ namespace ET.DrSdk
                     SegmentId = _currentSegmentId, FileOffset = fileOffset, DataLength = dataLength, Crc32 = crc32
                 };
                 _activeWriter.Flush();
-                _activeStream.Flush(); //开启 Asynchronous  用_activeStream.FlushAsync()更好
+                //_activeStream.Flush(); //使用这个跟_activeWriter.Flush是等价的  开启 Asynchronous  用_activeStream.FlushAsync()更好
                 
                 if (TimeInfo.Instance.ClientNow() - _lastSaveMs >= SAVE_INTERVAL_MS)
                 {
@@ -348,7 +354,7 @@ namespace ET.DrSdk
                     }
                     
                     writer.Flush();
-                    fs.Flush();// 开启 Asynchronous  fs.FlushAsync()更好
+                    //fs.Flush();//等价于writer.Flush() 开启 Asynchronous  fs.FlushAsync()更好
                 }
                 _config.Log($"索引保存成功");
             }
@@ -468,6 +474,7 @@ namespace ET.DrSdk
             catch
             {
                 // 索引文件损坏，忽略
+                Log.Error($"[DRSDK] 索引损坏，改为从 segment 重建");
                 RebuildIndexFromSegments();//重建有可能导致相同Event重发，但是总比丢的好
                 return;//重建自身也可能抛，别掉进下面的截断判断里再重建一次
             }
@@ -482,6 +489,7 @@ namespace ET.DrSdk
 
             if (File.Exists(GetSegmentFilePath(_currentSegmentId + 1)))
             {
+                Log.Error($"[DRSDK] 索引块不匹配，磁盘最大块{_currentSegmentId + 1}，改为从 segment 重建");
                 RebuildIndexFromSegments();//重建有可能导致相同Event重发，但是总比丢的好
             }
         }
@@ -526,11 +534,12 @@ namespace ET.DrSdk
                 _activeWriter = null;
                 _activeStream?.Dispose();
                 _activeStream = null;
-                _config.Log($"优雅关闭，刷盘");
+                _config.Log($"优雅关闭刷盘成功");
             }
             catch
             {
                 // 忽略释放错误
+                Log.Error($"[DRSDK] 优雅关闭刷盘失败");
             }
         }
         
@@ -581,6 +590,10 @@ namespace ET.DrSdk
 
         
         
+        private static long NextOffset(long current, long declaredSkip, long fileLength)
+        {
+            return declaredSkip > 4 && current + declaredSkip <= fileLength ? current + declaredSkip : current + 4;
+        }
         /// <summary>
         /// 从所有 segment 文件重建索引
         /// </summary>
@@ -594,8 +607,8 @@ namespace ET.DrSdk
             var newIndex = new Dictionary<string, EventIndex>();
             
             // 段号以「盘上实际文件名」为准，而不是只看索引条目：
-            // 尾部可能存在不含有效事件的空段。
-            var maxSegmentId = 0;
+            // 尾部可能存在不含有效事件的空段。但"名字像段、内容不是段"的文件不算（见下面 hasRecord）。
+            int maxSegmentId = 0;
             
             foreach (var segmentFile in segmentFiles)
             {
@@ -605,14 +618,12 @@ namespace ET.DrSdk
                     _config.Log($"跳过非段文件名: {Path.GetFileName(segmentFile)}");
                     continue;
                 }
-                if (segmentId > maxSegmentId)
-                {
-                    maxSegmentId = segmentId;
-                }
                 
-                using var fs = new FileStream(segmentFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                using var fs = new FileStream(segmentFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, BUFFER_SIZE,
+                    FileOptions.SequentialScan);
                 using var reader = new BinaryReader(fs, Encoding.UTF8, true);
                 
+                bool hasRecord = false;
                 long offset = 0;
                 while (offset < fs.Length)
                 {
@@ -632,7 +643,7 @@ namespace ET.DrSdk
                         var eventIdLength = reader.ReadInt32();
                         if (eventIdLength <= 0 || eventIdLength > MAX_EVENTID_LENGTH)
                         {
-                            offset += 4 + 4 + eventIdLength + 4 + 4;
+                            offset = NextOffset(offset, 4L + 4 + eventIdLength + 4 + 4, fs.Length);
                             continue;
                         }
                         
@@ -643,7 +654,7 @@ namespace ET.DrSdk
                         var dataLength = reader.ReadInt32();
                         if (dataLength <= 0 || dataLength > SEGMENTSIZE)
                         {
-                            offset += 4 + 4 + eventIdLength + 4 + 4 + dataLength + 4;
+                            offset = NextOffset(offset, 4L + 4 + eventIdLength + 4 + 4 + dataLength + 4, fs.Length);
                             continue;
                         }
                         
@@ -663,6 +674,7 @@ namespace ET.DrSdk
                             DataLength = dataLength,
                             Crc32 = crc32
                         };
+                        hasRecord = true;
                         
                         offset += totalSize;
                     }
@@ -674,6 +686,17 @@ namespace ET.DrSdk
                     {
                         _config.Log($"读取事件失败: {ex.Message}");
                         offset += 4;  // 跳过损坏部分
+                    }
+                }
+                
+                // 一条记录都解析不出、又不是空文件的，不认它是段：否则丢进来一个 event_000099.dat
+                // 就会把段号顶上去，之后新事件全追加进那个垃圾文件，而且它永远清不掉。
+                // 空文件要算（换段时刚建出来、还没来得及写）。
+                if (hasRecord || fs.Length == 0)
+                {
+                    if (segmentId > maxSegmentId)
+                    {
+                        maxSegmentId = segmentId;
                     }
                 }
             }
