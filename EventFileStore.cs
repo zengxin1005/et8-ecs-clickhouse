@@ -25,13 +25,9 @@ namespace ET.DrSdk
         
         private readonly Dictionary<string, EventIndex> _index = new();
         private bool _isDisposed;
-
-        /// <summary>
-        /// 上次落索引的时间(ET 毫秒时间戳，取值 TimeInfo.Instance.ClientNow())。
-        /// 不用 DateTime.Now：本地时间受时区/DST 变更影响会跳变，30 秒的落盘间隔会算不准。
-        /// </summary>
+        
         private long _lastSaveMs;
-        private const int SAVE_INTERVAL_MS = 30 * 1000;   // 每 30 秒保存一次
+        private const int SAVE_INTERVAL_MS = 15 * 1000;   // 每 15 秒保存一次
         private const uint FILE_MAGIC = 0x4B41464B;
         private const string INDEX_FILE = "events.idx";
         private const string SEGMENT_PREFIX = "event_";
@@ -78,22 +74,27 @@ namespace ET.DrSdk
             if (data == null || data.Length == 0)
                 throw new ArgumentException("Data cannot be null or empty");
             
+            var dataLength = data.Length;
+            var eventIdBytes = Encoding.UTF8.GetBytes(eventId);
+
+            if (eventIdBytes.Length > MAX_EVENTID_LENGTH)
+            {
+                throw new ArgumentException($"Event ID too long: {eventIdBytes.Length} > {MAX_EVENTID_LENGTH}");
+            }
+            if (dataLength > SEGMENTSIZE)
+            {
+                throw new ArgumentException($"Event data too large: {dataLength} > {SEGMENTSIZE}");
+            }
+
+            if (_index.ContainsKey(eventId))
+            {
+                throw new ArgumentException($"Event ID duplicate: {eventId}");
+            }
+
             try
             {
-                var dataLength = data.Length;
                 var crc32 = CalculateCrc32(data);
-                var eventIdBytes = Encoding.UTF8.GetBytes(eventId);
 
-                if (eventIdBytes.Length > MAX_EVENTID_LENGTH)
-                {
-                    throw new ArgumentException($"Event ID too long: {eventIdBytes.Length} > {MAX_EVENTID_LENGTH}");
-                }
-                // 读取侧（LoadIndex / 重建）会把 DataLength > SEGMENTSIZE 的记录当脏数据跳过，
-                // 所以写入侧必须先拒：否则写进去的记录永远读不出来，还会为它单开一个段。
-                if (dataLength > SEGMENTSIZE)
-                {
-                    throw new ArgumentException($"Event data too large: {dataLength} > {SEGMENTSIZE}");
-                }
                 if (_activeWriter == null)
                 {
                     EnsureActiveSegmentWriter();
@@ -115,6 +116,9 @@ namespace ET.DrSdk
                 _activeWriter.Write(dataLength);
                 _activeWriter.Write(data);
                 _activeWriter.Write(crc32);
+                
+                _activeWriter.Flush();//每次直接刷OS BUFFER_SIZE 就没有意义 
+                //_activeStream.Flush(); //_activeWriter.Flush()还会多刷自己缓冲，一般没有缓冲，   开启 Asynchronous  用_activeStream.FlushAsync()更好
 
                 _currentSegmentSize += totalSize;
 
@@ -122,8 +126,6 @@ namespace ET.DrSdk
                 {
                     SegmentId = _currentSegmentId, FileOffset = fileOffset, DataLength = dataLength, Crc32 = crc32
                 };
-                _activeWriter.Flush();
-                //_activeStream.Flush(); //使用这个跟_activeWriter.Flush是等价的  开启 Asynchronous  用_activeStream.FlushAsync()更好
                 
                 if (TimeInfo.Instance.ClientNow() - _lastSaveMs >= SAVE_INTERVAL_MS)
                 {
@@ -146,6 +148,11 @@ namespace ET.DrSdk
         
         public bool StoreEventString(string eventId, string data)
         {
+            if (data == null)
+            {
+                throw new ArgumentNullException(nameof(data));
+            }
+
             var bytes = Encoding.UTF8.GetBytes(data);
             return StoreEvent(eventId, bytes);
         }
@@ -257,10 +264,10 @@ namespace ET.DrSdk
         
         #region 删除操作
         
-        public bool DeleteEvent(string eventId)
+        public void DeleteEvent(string eventId)
         {
             if (string.IsNullOrEmpty(eventId))
-                return false;
+                return ;
             
             if (_index.Remove(eventId, out _))
             {
@@ -269,9 +276,7 @@ namespace ET.DrSdk
                     SaveIndex();//一定次数保存一次可能会丢，但影响不大，可以降低磁盘IO
                     _lastSaveMs = TimeInfo.Instance.ClientNow();
                 }
-                return true;
             }
-            return false;
         }
         
         
@@ -292,34 +297,13 @@ namespace ET.DrSdk
         public Queue<string> GetAllEventIdsAsQueue(int maxCount)
         {
             if (maxCount <= 0) return new Queue<string>();
-            if (maxCount >= _index.Count) return new Queue<string>(_index.Keys);
 
-            // max-heap：堆顶是当前保留集合中最大的
-            var heap = new PriorityQueue<string, long>(
-                initialCapacity: maxCount,
-                comparer: Comparer<long>.Create((a, b) => b.CompareTo(a)));
+            var ordered = _index
+                .OrderBy(kvp => kvp.Value.SegmentId)
+                .ThenBy(kvp => kvp.Value.FileOffset);
 
-            foreach (var kvp in _index)
-            {
-                long key = ((long)kvp.Value.SegmentId << 32) | (uint)kvp.Value.FileOffset;
-                if (heap.Count < maxCount)
-                    heap.Enqueue(kvp.Key, key);
-                else
-                {
-                    heap.TryPeek(out _, out long topKey);
-                    if (key < topKey)
-                    {
-                        heap.Dequeue();
-                        heap.Enqueue(kvp.Key, key);
-                    }
-                }
-            }
-
-            // max-heap 弹出是降序，反转成升序（最早在前）
-            var result = new List<string>(heap.Count);
-            while (heap.Count > 0) result.Add(heap.Dequeue());
-            result.Reverse();
-            return new Queue<string>(result);
+            // 取不满时也要按写入序截取最早的 maxCount 条
+            return new Queue<string>(ordered.Take(maxCount).Select(kvp => kvp.Key));
         }
         
         public int GetEventCount()
@@ -353,8 +337,8 @@ namespace ET.DrSdk
                         writer.Write(kvp.Value.Crc32);
                     }
                     
-                    writer.Flush();
-                    //fs.Flush();//等价于writer.Flush() 开启 Asynchronous  fs.FlushAsync()更好
+                    writer.Flush();//每次直接刷OS BUFFER_SIZE 就没有意义 
+                    //fs.Flush();//writer.Flush()还会多刷自己缓冲，一般没有缓冲， 开启 Asynchronous  fs.FlushAsync()更好
                 }
                 _config.Log($"索引保存成功");
             }
@@ -424,7 +408,7 @@ namespace ET.DrSdk
             
             if (!File.Exists(indexFile))
             {
-                RebuildIndexFromSegments();//重建有可能导致相同Event重发，但是总比丢的好
+                RebuildIndexFromSegments();
                 return;
             }
             
@@ -475,22 +459,15 @@ namespace ET.DrSdk
             {
                 // 索引文件损坏，忽略
                 Log.Error($"[DRSDK] 索引损坏，改为从 segment 重建");
-                RebuildIndexFromSegments();//重建有可能导致相同Event重发，但是总比丢的好
-                return;//重建自身也可能抛，别掉进下面的截断判断里再重建一次
+                RebuildIndexFromSegments();
+                return;
             }
             
             // 半截索引：_index 只覆盖前段，看着"正常"（非空、不报错），但索引没提到的那些 segment
             if (count < 0 || loaded < count)
             {
                 Log.Error($"[DRSDK] 索引不完整: 只读出 {loaded}/{count} 条，改为从 segment 重建");
-                RebuildIndexFromSegments();//重建有可能导致相同Event重发，但是总比丢的好
-                return;
-            }
-
-            if (File.Exists(GetSegmentFilePath(_currentSegmentId + 1)))
-            {
-                Log.Error($"[DRSDK] 索引块不匹配，磁盘最大块{_currentSegmentId + 1}，改为从 segment 重建");
-                RebuildIndexFromSegments();//重建有可能导致相同Event重发，但是总比丢的好
+                RebuildIndexFromSegments();
             }
         }
         
@@ -550,7 +527,6 @@ namespace ET.DrSdk
             try
             {
                 var activeSegmentIds = _index.Values.Select(idx => idx.SegmentId).Distinct().ToHashSet();
-
                 string[] files = Directory.GetFiles(_storePath, $"{SEGMENT_PREFIX}*{SEGMENT_EXT}");
                 foreach (var file in files)
                 {
@@ -560,10 +536,10 @@ namespace ET.DrSdk
                         _config.Log($"跳过非段文件名: {Path.GetFileName(file)}");
                         continue;
                     }
+                    
                     if (segmentId == _currentSegmentId)
-                    {
                         continue;
-                    }
+                    
                     if (!activeSegmentIds.Contains(segmentId))
                     {
                         File.Delete(file);
@@ -599,11 +575,17 @@ namespace ET.DrSdk
         /// </summary>
         private void RebuildIndexFromSegments()
         {
+            //重建有可能导致相同Event重发，但是总比丢的好
             var segmentFiles = Directory.GetFiles(_storePath, $"{SEGMENT_PREFIX}*{SEGMENT_EXT}")
                 .OrderBy(f => f)  // 按文件名排序
                 .ToList();
-            if(segmentFiles.Count == 0)
+            if (segmentFiles.Count == 0)
+            {
+                _index.Clear();
+                _config.Log($"没有找到任何 segment 文件，索引已清空");
                 return;
+            }
+
             var newIndex = new Dictionary<string, EventIndex>();
             
             // 段号以「盘上实际文件名」为准，而不是只看索引条目：
@@ -623,7 +605,7 @@ namespace ET.DrSdk
                     FileOptions.SequentialScan);
                 using var reader = new BinaryReader(fs, Encoding.UTF8, true);
                 
-                bool hasRecord = false;
+
                 long offset = 0;
                 while (offset < fs.Length)
                 {
@@ -674,7 +656,7 @@ namespace ET.DrSdk
                             DataLength = dataLength,
                             Crc32 = crc32
                         };
-                        hasRecord = true;
+ 
                         
                         offset += totalSize;
                     }
@@ -688,16 +670,9 @@ namespace ET.DrSdk
                         offset += 4;  // 跳过损坏部分
                     }
                 }
-                
-                // 一条记录都解析不出、又不是空文件的，不认它是段：否则丢进来一个 event_000099.dat
-                // 就会把段号顶上去，之后新事件全追加进那个垃圾文件，而且它永远清不掉。
-                // 空文件要算（换段时刚建出来、还没来得及写）。
-                if (hasRecord || fs.Length == 0)
+                if (segmentId > maxSegmentId)
                 {
-                    if (segmentId > maxSegmentId)
-                    {
-                        maxSegmentId = segmentId;
-                    }
+                    maxSegmentId = segmentId;
                 }
             }
             
