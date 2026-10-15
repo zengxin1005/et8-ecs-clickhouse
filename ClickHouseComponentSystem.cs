@@ -86,7 +86,7 @@ namespace ET.Server
         /// <summary>
         /// 将DataReader读取为List<T>
         /// </summary>
-        private static async Task<List<T>> ReadReaderToListAsync<T>(DbDataReader reader) where T : class, new()
+        private static async ETTask<List<T>> ReadReaderToListAsync<T>(DbDataReader reader) where T : class, new()
         {
             var result = new List<T>();
             var properties = typeof(T).GetProperties();
@@ -128,7 +128,7 @@ namespace ET.Server
         /// <summary>
         /// 将DataReader读取为单个实体
         /// </summary>
-        private static async Task<T> ReadReaderFirstOrDefaultAsync<T>(DbDataReader reader) where T : class, new()
+        private static async ETTask<T> ReadReaderFirstOrDefaultAsync<T>(DbDataReader reader) where T : class, new()
         {
             var properties = typeof(T).GetProperties();
             var columnNames = Enumerable.Range(0, reader.FieldCount)
@@ -170,7 +170,7 @@ namespace ET.Server
         /// <summary>
         /// 将DataReader读取为动态列表
         /// </summary>
-        private static async Task<List<dynamic>> ReadReaderToDynamicListAsync(DbDataReader reader)
+        private static async ETTask<List<dynamic>> ReadReaderToDynamicListAsync(DbDataReader reader)
         {
             var result = new List<dynamic>();
             var columnNames = Enumerable.Range(0, reader.FieldCount)
